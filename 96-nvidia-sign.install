@@ -1,0 +1,46 @@
+#!/usr/bin/bash -
+#
+# 96-nvidia-sign.install
+#
+# kernel-install plugin: after a kernel is added, sign the akmod NVIDIA
+# modules and rebuild that kernel's initramfs, so the signed open modules
+# load under Secure Boot and are present for early KMS (LUKS prompt on the
+# dGPU).
+#
+# Runs at 96 -- after 50-dracut.install and 95-akmodsposttrans.install. Unlike
+# the akmods plugin, it does NOT bail under system-update.target, so it also
+# covers GNOME Software / PackageKit OFFLINE updates. nvidia-akmods-sign is
+# fail-soft, so a failure here never aborts the kernel install.
+#
+# DETACHED since 2026-07-13 (systemd-run --no-block): when a kernel update
+# also needs a fresh kmod-nvidia build, `akmods` internally runs its own
+# `dnf install` of the package it just built. Called inline (as this used to
+# do), that nested dnf deadlocks forever against the still-open outer
+# `dnf upgrade` transaction -- it can never acquire the rpm lock the parent
+# transaction is holding. Detaching via systemd-run lets the outer dnf finish
+# and release the lock first; this then runs for real moments later.
+# Trade-off: this kernel's first boot is no longer GUARANTEED to have signed
+# modules ready the instant the update finishes -- reboot before the detached
+# job completes (normally well under a minute) and you'll hit a black screen
+# needing the recovery boot line once; nvidia-akmods-sign.service (the
+# per-boot safety net) self-heals it from there. Also unproven whether the
+# offline-update environment survives long enough for the detached job to
+# finish before it reboots -- same recovery path applies if not.
+
+COMMAND="${1:-}"
+KERNEL_VERSION="${2:-}"
+
+[[ -n "${KERNEL_VERSION}" ]] || exit 0
+[[ -x /usr/local/sbin/nvidia-akmods-sign ]] || exit 0
+
+case "${COMMAND}" in
+    add)
+        systemd-run --no-block --collect \
+            --description="Sign nvidia akmod for kernel ${KERNEL_VERSION} (detached, avoids dnf lock deadlock)" \
+            /usr/local/sbin/nvidia-akmods-sign "${KERNEL_VERSION}" \
+            || true
+        ;;
+    *)
+        : ;;
+esac
+exit 0

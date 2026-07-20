@@ -1,0 +1,18 @@
+[Unit]
+Description=Sign akmod NVIDIA modules & refresh initramfs (Secure Boot, early KMS)
+# Run after akmods has (re)built modules at boot -- catches DRIVER-only updates
+# whose rebuild was deferred to boot, and is a safety net for the kernel-install
+# plugin. Skipped automatically in the offline-update environment because that
+# boot reaches system-update.target, not multi-user.target.
+After=akmods.service
+Wants=akmods.service
+ConditionPathExists=/usr/local/sbin/nvidia-akmods-sign
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/nvidia-akmods-sign
+# building/signing/dracut can take a while after an update; don't time out early
+TimeoutStartSec=900
+
+[Install]
+WantedBy=multi-user.target

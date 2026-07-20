@@ -1,0 +1,113 @@
+#!/usr/bin/env bash
+#
+# nvidia-akmods-sign [<kver>]
+#
+# Build (if needed), MOK-sign, and bake the RPM Fusion akmod NVIDIA modules into
+# the initramfs of <kver> (default: running kernel), so the signed *open* modules
+# load under Secure Boot AND are present early enough for KMS to draw the LUKS
+# passphrase prompt (monitor is on the dGPU).
+#
+# Idempotent and FAIL-SOFT: on any error it logs and exits 0, so it can never
+# break a kernel install or a boot. Full background: ~/nvidia-secureboot-blackwell-fedora44.md
+#
+# Triggers that call this:
+#   - /etc/kernel/install.d/96-nvidia-sign.install  (kernel add: dnf + GNOME offline)
+#   - nvidia-akmods-sign.service                     (each boot, After=akmods.service)
+
+set -uo pipefail
+trap 'exit 0' EXIT          # never return non-zero to the caller
+
+KVER="${1:-$(uname -r)}"
+TAG="nvidia-akmods-sign"
+PRIV="/etc/pki/akmods/private/private_key.priv"
+CERT="/etc/pki/akmods/certs/public_key.der"
+MODDIR="/lib/modules/${KVER}/extra/nvidia"
+KMS_CONF="/etc/dracut.conf.d/99-nvidia-kms.conf"
+MODSET="/etc/modprobe.d/nvidia-modeset.conf"
+IMG="/boot/initramfs-${KVER}.img"
+
+log() { echo "${TAG}[${KVER}]: $*"; logger -t "${TAG}" -- "[${KVER}] $*" 2>/dev/null || true; }
+
+[[ ${EUID} -eq 0 ]] || { log "not root; skipping"; exit 0; }
+if [[ ! -r "${PRIV}" || ! -r "${CERT}" ]]; then
+  log "signing key not found (${CERT}); skipping"; exit 0
+fi
+
+# Locate sign-file for this kernel (needs kernel-devel-<kver>).
+SF=""
+for c in "/usr/src/kernels/${KVER}/scripts/sign-file" \
+         "/lib/modules/${KVER}/build/scripts/sign-file"; do
+  [[ -x "${c}" ]] && SF="${c}" && break
+done
+
+# --- 1. ensure the module exists for this kernel (build only if missing) ---
+if [[ ! -e "${MODDIR}/nvidia.ko" && ! -e "${MODDIR}/nvidia.ko.xz" ]]; then
+  if command -v akmods >/dev/null 2>&1; then
+    log "modules absent; building via akmods"
+    akmods --kernels "${KVER}" >/dev/null 2>&1 || log "akmods build reported an error"
+  fi
+fi
+[[ -d "${MODDIR}" ]] || { log "no nvidia module dir for ${KVER}; nothing to do"; exit 0; }
+[[ -n "${SF}" ]]     || { log "sign-file missing (need kernel-devel-${KVER}); cannot sign"; exit 0; }
+
+changed=0
+shopt -s nullglob
+
+# --- 2. sign every nvidia module, left UNCOMPRESSED (kernel-loadable, no xz pitfalls) ---
+for x in "${MODDIR}"/*.ko.xz; do
+  if xz -d -f "${x}" 2>/dev/null; then changed=1; fi   # -> .ko, removes .ko.xz
+done
+for ko in "${MODDIR}"/*.ko; do
+  if tail -c 64 "${ko}" 2>/dev/null | grep -aq "Module signature appended"; then
+    continue                                            # already signed (by us)
+  fi
+  if "${SF}" sha256 "${PRIV}" "${CERT}" "${ko}" 2>/dev/null; then
+    log "signed $(basename "${ko}")"; changed=1
+  else
+    log "FAILED to sign $(basename "${ko}")"
+  fi
+done
+command -v restorecon >/dev/null && restorecon -RF "${MODDIR}" 2>/dev/null || true
+depmod -a "${KVER}" 2>/dev/null || true
+
+# --- 3. (re)generate early-KMS dracut config with the CURRENT driver's GSP firmware ---
+NVVER="$(modinfo "${MODDIR}/nvidia.ko" -F version 2>/dev/null)"
+FWDIR="/lib/firmware/nvidia/${NVVER}"
+{
+  echo "# Managed by ${TAG}. NVIDIA early KMS so the signed modules are in the"
+  echo "# initramfs and the dGPU lights up the LUKS prompt. Driver: ${NVVER:-unknown}"
+  echo 'force_drivers+=" nvidia nvidia_modeset nvidia_drm nvidia_uvm "'
+  if [[ -d "${FWDIR}" ]]; then
+    fw="$(find "${FWDIR}" -type f -name 'gsp_*.bin' 2>/dev/null | sort | tr '\n' ' ')"
+    [[ -n "${fw}" ]] && echo "install_items+=\" ${fw}\""
+  fi
+} > "${KMS_CONF}.new"
+if ! cmp -s "${KMS_CONF}.new" "${KMS_CONF}" 2>/dev/null; then
+  mv -f "${KMS_CONF}.new" "${KMS_CONF}"; changed=1; log "updated ${KMS_CONF} (driver ${NVVER:-unknown})"
+else
+  rm -f "${KMS_CONF}.new"
+fi
+
+# nvidia-drm modeset/fbdev drop-in (needed to render the console/prompt)
+if [[ ! -f "${MODSET}" ]] || ! grep -q 'modeset=1' "${MODSET}" 2>/dev/null; then
+  echo 'options nvidia-drm modeset=1 fbdev=1' > "${MODSET}"; changed=1; log "wrote ${MODSET}"
+fi
+
+# --- 4. rebuild this kernel's initramfs if anything changed or nvidia isn't in it ---
+need=0
+[[ ${changed} -eq 1 ]] && need=1
+if [[ -f "${IMG}" ]] && ! lsinitrd "${IMG}" 2>/dev/null | grep -E '/nvidia\.ko(\.xz)?$' >/dev/null 2>&1; then need=1; fi
+if [[ ${need} -eq 1 ]]; then
+  log "rebuilding initramfs ${IMG}"
+  dracut --force "${IMG}" "${KVER}" 2>/dev/null || log "dracut reported an error"
+  if lsinitrd "${IMG}" 2>/dev/null | grep -E '/nvidia\.ko(\.xz)?$' >/dev/null 2>&1; then
+    log "OK: signed nvidia module is in the initramfs"
+  else
+    log "WARNING: nvidia module NOT in initramfs after rebuild"
+  fi
+else
+  log "no changes; initramfs untouched"
+fi
+
+log "done"
+exit 0
