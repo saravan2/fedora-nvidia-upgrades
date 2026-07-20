@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+#
+# nvidia-akmods-history
+#
+# Summarizes /var/log/nvidia-akmods-sign.log -- the persistent, append-only
+# record nvidia-akmods-sign writes on every run. Unlike journald, this file
+# isn't rotated away, so it's a running count of how many kernel/driver
+# updates this method has handled on this machine.
+
+set -uo pipefail
+HIST_FILE="/var/log/nvidia-akmods-sign.log"
+
+if [[ ! -s "${HIST_FILE}" ]]; then
+  echo "No history yet: ${HIST_FILE} not found or empty."
+  echo "(It's written by nvidia-akmods-sign on its next run.)"
+  exit 0
+fi
+
+total=$(wc -l < "${HIST_FILE}")
+builds=$(grep -c 'event=build_sign' "${HIST_FILE}")
+verifies=$(grep -c 'event=verify' "${HIST_FILE}")
+ok=$(grep -c 'result=ok' "${HIST_FILE}")
+warnings=$(grep -c 'result=warning' "${HIST_FILE}")
+skipped=$(grep -c 'result=skipped' "${HIST_FILE}")
+kernels=$(grep -o 'kernel=[^ ]*' "${HIST_FILE}" | sort -u | wc -l)
+first=$(head -n1 "${HIST_FILE}" | awk '{print $1}')
+last=$(tail -n1 "${HIST_FILE}" | awk '{print $1}')
+
+echo "nvidia-akmods-sign history: ${HIST_FILE}"
+echo "  runs logged:           ${total}  (since ${first}, last ${last})"
+echo "  distinct kernels seen: ${kernels}"
+echo "  build+sign events:     ${builds}"
+echo "  verify-only runs:      ${verifies}"
+echo "  ok / warning / skipped:${ok} / ${warnings} / ${skipped}"
+
+if [[ "${warnings}" -gt 0 || "${skipped}" -gt 0 ]]; then
+  echo
+  echo "Runs needing attention:"
+  grep -E 'result=(warning|skipped)' "${HIST_FILE}" | tail -n 10
+fi

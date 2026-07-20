@@ -8,14 +8,16 @@
 # passphrase prompt (monitor is on the dGPU).
 #
 # Idempotent and FAIL-SOFT: on any error it logs and exits 0, so it can never
-# break a kernel install or a boot. Full background: ~/nvidia-secureboot-blackwell-fedora44.md
+# break a kernel install or a boot. Full background: README.md in this repo.
 #
 # Triggers that call this:
 #   - /etc/kernel/install.d/96-nvidia-sign.install  (kernel add: dnf + GNOME offline)
 #   - nvidia-akmods-sign.service                     (each boot, After=akmods.service)
+#
+# Every run appends one line to HIST_FILE, so `nvidia-akmods-history` can show a
+# running count of kernel/driver updates this method has handled -- see README.
 
 set -uo pipefail
-trap 'exit 0' EXIT          # never return non-zero to the caller
 
 KVER="${1:-$(uname -r)}"
 TAG="nvidia-akmods-sign"
@@ -25,12 +27,33 @@ MODDIR="/lib/modules/${KVER}/extra/nvidia"
 KMS_CONF="/etc/dracut.conf.d/99-nvidia-kms.conf"
 MODSET="/etc/modprobe.d/nvidia-modeset.conf"
 IMG="/boot/initramfs-${KVER}.img"
+HIST_FILE="/var/log/nvidia-akmods-sign.log"
 
 log() { echo "${TAG}[${KVER}]: $*"; logger -t "${TAG}" -- "[${KVER}] $*" 2>/dev/null || true; }
 
-[[ ${EUID} -eq 0 ]] || { log "not root; skipping"; exit 0; }
+# --- history line: one per run, written on every exit path (success or not) ---
+NVVER=""
+EVENT="skip"          # skip | verify | build_sign
+RESULT="skipped"      # skipped | ok | warning
+REASON=""             # set on skip/warning paths
+MODULES_SIGNED=0
+
+write_history() {
+  local ts driver
+  ts="$(date -Is 2>/dev/null || date)"
+  driver="${NVVER:-unknown}"
+  {
+    printf '%s kernel=%s driver=%s event=%s result=%s modules_signed=%s' \
+      "${ts}" "${KVER}" "${driver}" "${EVENT}" "${RESULT}" "${MODULES_SIGNED}"
+    [[ -n "${REASON}" ]] && printf ' reason=%s' "${REASON}"
+    printf '\n'
+  } 2>/dev/null >> "${HIST_FILE}" || true
+}
+trap 'write_history; exit 0' EXIT   # never return non-zero to the caller
+
+[[ ${EUID} -eq 0 ]] || { log "not root; skipping"; REASON="not_root"; exit 0; }
 if [[ ! -r "${PRIV}" || ! -r "${CERT}" ]]; then
-  log "signing key not found (${CERT}); skipping"; exit 0
+  log "signing key not found (${CERT}); skipping"; REASON="no_signing_key"; exit 0
 fi
 
 # Locate sign-file for this kernel (needs kernel-devel-<kver>).
@@ -47,8 +70,12 @@ if [[ ! -e "${MODDIR}/nvidia.ko" && ! -e "${MODDIR}/nvidia.ko.xz" ]]; then
     akmods --kernels "${KVER}" >/dev/null 2>&1 || log "akmods build reported an error"
   fi
 fi
-[[ -d "${MODDIR}" ]] || { log "no nvidia module dir for ${KVER}; nothing to do"; exit 0; }
-[[ -n "${SF}" ]]     || { log "sign-file missing (need kernel-devel-${KVER}); cannot sign"; exit 0; }
+if [[ ! -d "${MODDIR}" ]]; then
+  log "no nvidia module dir for ${KVER}; nothing to do"; REASON="no_module_dir"; exit 0
+fi
+if [[ -z "${SF}" ]]; then
+  log "sign-file missing (need kernel-devel-${KVER}); cannot sign"; REASON="no_sign_file"; exit 0
+fi
 
 changed=0
 shopt -s nullglob
@@ -63,6 +90,7 @@ for ko in "${MODDIR}"/*.ko; do
   fi
   if "${SF}" sha256 "${PRIV}" "${CERT}" "${ko}" 2>/dev/null; then
     log "signed $(basename "${ko}")"; changed=1
+    MODULES_SIGNED=$((MODULES_SIGNED + 1))
   else
     log "FAILED to sign $(basename "${ko}")"
   fi
@@ -98,14 +126,19 @@ need=0
 [[ ${changed} -eq 1 ]] && need=1
 if [[ -f "${IMG}" ]] && ! lsinitrd "${IMG}" 2>/dev/null | grep -E '/nvidia\.ko(\.xz)?$' >/dev/null 2>&1; then need=1; fi
 if [[ ${need} -eq 1 ]]; then
+  EVENT="build_sign"
   log "rebuilding initramfs ${IMG}"
   dracut --force "${IMG}" "${KVER}" 2>/dev/null || log "dracut reported an error"
   if lsinitrd "${IMG}" 2>/dev/null | grep -E '/nvidia\.ko(\.xz)?$' >/dev/null 2>&1; then
     log "OK: signed nvidia module is in the initramfs"
+    RESULT="ok"
   else
     log "WARNING: nvidia module NOT in initramfs after rebuild"
+    RESULT="warning"; REASON="nvidia_not_in_initramfs"
   fi
 else
+  EVENT="verify"
+  RESULT="ok"
   log "no changes; initramfs untouched"
 fi
 

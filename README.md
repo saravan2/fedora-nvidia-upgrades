@@ -69,7 +69,9 @@ This repo's hook automates causes 2–4 on every kernel/driver update. Cause 1
   it doesn't bail under `system-update.target`).
 - **`nvidia-akmods-sign.service`** — runs once per boot after
   `akmods.service`, to catch driver-only updates and act as a safety net.
-- **`install.sh`** — installs the three files above, enables the boot
+- **`nvidia-akmods-history`** — summarizes the persistent log below into a
+  one-screen "how many updates has this handled" report.
+- **`install.sh`** — installs the four files above, enables the boot
   service, and does a test run against the running kernel.
 
 ## Prerequisites
